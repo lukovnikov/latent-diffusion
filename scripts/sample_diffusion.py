@@ -30,7 +30,7 @@ def custom_to_np(x):
     sample = ((sample + 1) * 127.5).clamp(0, 255).to(torch.uint8)
     sample = sample.permute(0, 2, 3, 1)
     sample = sample.contiguous()
-    return sample
+    return sample.numpy()
 
 
 def logs2pil(logs, keys=["sample"]):
@@ -77,7 +77,7 @@ def convsample_ddim(model, steps, shape, eta=1.0
 
 @torch.no_grad()
 def make_convolutional_sample(model, batch_size, vanilla=False, custom_steps=None, eta=1.0,):
-
+    model.eval()
 
     log = dict()
 
@@ -182,7 +182,7 @@ def get_parser():
         type=float,
         nargs="?",
         help="eta for ddim sampling (0.0 yields deterministic sampling)",
-        default=1.0
+        default=0.0         # changed default to fully deterministic sampling
     )
     parser.add_argument(
         "-v",
@@ -239,6 +239,10 @@ def load_model(config, ckpt, gpu, eval_mode):
     return model, global_step
 
 
+def count_parameters(m):
+    return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+
 if __name__ == "__main__":
     now = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     sys.path.append(os.getcwd())
@@ -285,6 +289,7 @@ if __name__ == "__main__":
     print(config)
 
     model, global_step = load_model(config, ckpt, gpu, eval_mode)
+    print(f"# Params: {count_parameters(model) // 1e6:.2f}M")
     print(f"global step: {global_step}")
     print(75 * "=")
     print("logging to:")
