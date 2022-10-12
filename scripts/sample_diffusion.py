@@ -137,7 +137,8 @@ def run(model, logdir, batch_size=50, vanilla=False, custom_steps=None, eta=None
     else:
        raise NotImplementedError('Currently only sampling for unconditional models supported.')
 
-    print(f"sampling of {n_saved} images finished in {(time.time() - tstart) / 60.:.2f} minutes.")
+    print(f"sampling of {n_saved} images finished in {(time.time() - tstart) / 60.:.2f} minutes."
+          f"\nResults saved in {logdir}")
 
 
 def save_logs(logs, path, n_saved=0, key="sample", np_path=None):
@@ -225,7 +226,7 @@ def load_model_from_config(config, sd):
     return model
 
 
-def load_model(config, ckpt, gpu, eval_mode):
+def load_model(config, ckpt):
     if ckpt:
         print(f"Loading model from {ckpt}")
         pl_sd = torch.load(ckpt, map_location="cpu")
@@ -243,6 +244,39 @@ def count_parameters(m):
     return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
 
+def load_from_checkpoint(resume, unknown):
+    if not os.path.exists(resume):
+        raise ValueError("Cannot find {}".format(resume))
+    
+    if os.path.isfile(resume):
+        # paths = resume.split("/")
+        try:
+            logdir = '/'.join(resume.split('/')[:-1])
+            # idx = len(paths)-paths[::-1].index("logs")+1
+            print(f'Logdir is {logdir}')
+        except ValueError:
+            paths = resume.split("/")
+            idx = -2  # take a guess: path/to/logdir/checkpoints/model.ckpt
+            logdir = "/".join(paths[:idx])
+        ckpt = resume
+    else:
+        assert os.path.isdir(resume), f"{resume} is not a directory"
+        logdir = resume.rstrip("/")
+        ckpt = os.path.join(logdir, "model.ckpt")
+
+    base_configs = sorted(glob.glob(os.path.join(logdir, "config.yaml")))
+
+    configs = [OmegaConf.load(cfg) for cfg in base_configs]
+    cli = OmegaConf.from_dotlist(unknown)
+    config = OmegaConf.merge(*configs, cli)
+
+    model, global_step = load_model(config, ckpt)
+    print(f"# Params: {count_parameters(model) // 1e6:.2f}M")
+    print(f"global step: {global_step}")
+
+    return model, config, logdir, global_step
+
+
 if __name__ == "__main__":
     now = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     sys.path.append(os.getcwd())
@@ -252,33 +286,10 @@ if __name__ == "__main__":
     opt, unknown = parser.parse_known_args()
     ckpt = None
 
-    if not os.path.exists(opt.resume):
-        raise ValueError("Cannot find {}".format(opt.resume))
-    if os.path.isfile(opt.resume):
-        # paths = opt.resume.split("/")
-        try:
-            logdir = '/'.join(opt.resume.split('/')[:-1])
-            # idx = len(paths)-paths[::-1].index("logs")+1
-            print(f'Logdir is {logdir}')
-        except ValueError:
-            paths = opt.resume.split("/")
-            idx = -2  # take a guess: path/to/logdir/checkpoints/model.ckpt
-            logdir = "/".join(paths[:idx])
-        ckpt = opt.resume
-    else:
-        assert os.path.isdir(opt.resume), f"{opt.resume} is not a directory"
-        logdir = opt.resume.rstrip("/")
-        ckpt = os.path.join(logdir, "model.ckpt")
-
-    base_configs = sorted(glob.glob(os.path.join(logdir, "config.yaml")))
-    opt.base = base_configs
-
-    configs = [OmegaConf.load(cfg) for cfg in opt.base]
-    cli = OmegaConf.from_dotlist(unknown)
-    config = OmegaConf.merge(*configs, cli)
-
     gpu = True
     eval_mode = True
+
+    model, config, logdir, global_step = load_from_checkpoint(opt.resume, unknown)
 
     if opt.logdir != "none":
         locallog = logdir.split(os.sep)[-1]
@@ -287,10 +298,8 @@ if __name__ == "__main__":
         logdir = os.path.join(opt.logdir, locallog)
 
     print(config)
-
-    model, global_step = load_model(config, ckpt, gpu, eval_mode)
-    print(f"# Params: {count_parameters(model) // 1e6:.2f}M")
-    print(f"global step: {global_step}")
+    
+    
     print(75 * "=")
     print("logging to:")
     logdir = os.path.join(logdir, "samples", f"{global_step:08}", now)

@@ -57,10 +57,11 @@ model:
         lossconfig:
           target: torch.nn.Identity
     cond_stage_config: __is_unconditional__
+
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 48
+    batch_size: 20
     num_workers: 5
     wrap: false
     train:
@@ -71,7 +72,6 @@ data:
       target: taming.data.faceshq.CelebAHQValidation
       params:
         size: 256
-
 
 lightning:
   callbacks:
