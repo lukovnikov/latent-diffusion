@@ -84,6 +84,10 @@ lightning:
         batch_frequency: 5000
         max_images: 8
         increase_log_steps: False
+    distillphaser:
+      target: ldm.models.diffusion.distill.DistillPhaserCallback
+      params:
+        updatesperphase: [50000, 50000, 50000, 50000, 50000, 50000, 50000, 100000, 100000]
 
   trainer:
     benchmark: True

@@ -8,7 +8,10 @@ from functools import partial
 from ldm.modules.diffusionmodules.util import noise_like
 
 
-def make_ddim_timesteps(ddim_discr_method, num_ddim_jumps, total_steps, verbose=True):
+def make_ddim_timesteps(ddim_discr_method, num_ddim_jumps, total_steps, verbose=True, version="addfinal"):
+    if version == "addfinal":
+        num_ddim_jumps -= 1
+
     if ddim_discr_method == 'uniform':
         # c = total_steps // num_ddim_jumps
         # ddim_timesteps = list(range(0, total_steps, c))
@@ -24,9 +27,14 @@ def make_ddim_timesteps(ddim_discr_method, num_ddim_jumps, total_steps, verbose=
     timesteps = list(zip(ddim_timesteps[1:], ddim_timesteps[:-1]))
     timesteps = timesteps[::-1]
 
-    # OpenAI version
-    # timesteps = timesteps[1:-1]
-    # timesteps += [(timesteps[-1][1], 1), (1, 0)]
+    if version == "openai":
+        # OpenAI version
+        timesteps = timesteps[1:-1]
+        timesteps += [(timesteps[-1][1], 1), (1, 0)]
+
+    elif version == "addfinal":     # add one more timestep at the end
+        timesteps = timesteps[:-1]
+        timesteps += [(timesteps[-1][1], 1), (1, 0)]
 
     return timesteps
 
@@ -105,6 +113,7 @@ class DDIMSampler(object):
                log_every_t=100,
                unconditional_guidance_scale=1.,
                unconditional_conditioning=None,
+               ddimmode="normal",
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                **kwargs
                ):
@@ -118,7 +127,7 @@ class DDIMSampler(object):
                     print(f"Warning: Got {conditioning.shape[0]} conditionings but batch-size is {batch_size}")
 
         self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=verbose)
-        timesteps = make_ddim_timesteps("uniform", S, self.ddpm_num_timesteps)
+        timesteps = make_ddim_timesteps("uniform", S, self.ddpm_num_timesteps, version=ddimmode)
         # sampling
         C, H, W = shape
         size = (batch_size, C, H, W)
@@ -162,7 +171,7 @@ class DDIMSampler(object):
         print(f"Running DDIM Sampling with {len(timesteps)} timesteps")
 
         for i, (jump_start_t, jump_end_t) in enumerate(tqdm(timesteps, desc='DDIM Sampler', total=len(timesteps))):
-            ts = torch.full((b,), jump_start_t-1, device=device, dtype=torch.long)
+            ts = torch.full((b,), jump_start_t-1, device=device, dtype=torch.long)      # jump_start_t - 1 because jump_start_t is in regular time range (ends at 1000)
 
             if mask is not None:
                 assert x0 is not None

@@ -66,17 +66,16 @@ def convsample(model, shape, return_intermediates=True,
 
 
 @torch.no_grad()
-def convsample_ddim(model, steps, shape, eta=1.0
-                    ):
+def convsample_ddim(model, steps, shape, eta=1.0, ddimmode="normal"):
     ddim = DDIMSampler(model)
     bs = shape[0]
     shape = shape[1:]
-    samples, intermediates = ddim.sample(steps, batch_size=bs, shape=shape, eta=eta, verbose=False,)
+    samples, intermediates = ddim.sample(steps, batch_size=bs, shape=shape, eta=eta, verbose=False, ddimmode=ddimmode)
     return samples, intermediates
 
 
 @torch.no_grad()
-def make_convolutional_sample(model, batch_size, vanilla=False, custom_steps=None, eta=1.0,):
+def make_convolutional_sample(model, batch_size, vanilla=False, custom_steps=None, eta=1.0, ddimmode="normal"):
     model.eval()
 
     log = dict()
@@ -93,7 +92,7 @@ def make_convolutional_sample(model, batch_size, vanilla=False, custom_steps=Non
                                          make_prog_row=True)
         else:
             sample, intermediates = convsample_ddim(model,  steps=custom_steps, shape=shape,
-                                                    eta=eta)
+                                                    eta=eta, ddimmode=ddimmode)
 
         t1 = time.time()
 
@@ -105,7 +104,8 @@ def make_convolutional_sample(model, batch_size, vanilla=False, custom_steps=Non
     print(f'Throughput for this batch: {log["throughput"]}')
     return log
 
-def run(model, logdir, batch_size=50, vanilla=False, custom_steps=None, eta=None, n_samples=50000, nplog=None):
+
+def run(model, logdir, batch_size=50, vanilla=False, custom_steps=None, eta=None, n_samples=50000, nplog=None, ddimmode="normal"):
     if vanilla:
         print(f'Using Vanilla DDPM sampling with {model.num_timesteps} sampling steps.')
     else:
@@ -122,7 +122,7 @@ def run(model, logdir, batch_size=50, vanilla=False, custom_steps=None, eta=None
         for _ in trange(n_samples // batch_size, desc="Sampling Batches (unconditional)"):
             logs = make_convolutional_sample(model, batch_size=batch_size,
                                              vanilla=vanilla, custom_steps=custom_steps,
-                                             eta=eta)
+                                             eta=eta, ddimmode=ddimmode)
             n_saved = save_logs(logs, logdir, n_saved=n_saved, key="sample")
             all_images.extend([custom_to_np(logs["sample"])])
             if n_saved >= n_samples:
@@ -184,6 +184,12 @@ def get_parser():
         nargs="?",
         help="eta for ddim sampling (0.0 yields deterministic sampling)",
         default=0.0         # changed default to fully deterministic sampling
+    )
+    parser.add_argument(
+        "--ddimmode",
+        type=str,
+        help="'normal' for normal timestep selection, 'openai' or 'addfinal' ",
+        default="normal",
     )
     parser.add_argument(
         "-v",
@@ -320,7 +326,7 @@ if __name__ == "__main__":
     print(sampling_conf)
 
 
-    run(model, imglogdir, eta=opt.eta,
+    run(model, imglogdir, eta=opt.eta, ddimmode=opt.ddimmode,
         vanilla=opt.vanilla_sample,  n_samples=opt.n_samples, custom_steps=opt.custom_steps,
         batch_size=opt.batch_size, nplog=numpylogdir)
 

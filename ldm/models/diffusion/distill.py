@@ -5,6 +5,8 @@ https://github.com/openai/improved-diffusion/blob/e94489283bb876ac1477d5dd7709bb
 https://github.com/CompVis/taming-transformers
 -- merci
 """
+import os
+import random
 from copy import deepcopy
 
 import torch
@@ -428,7 +430,7 @@ class DDPM(pl.LightningModule):
         return opt
 
 
-class LatentDiffusion(DDPM):
+class DLatentDiffusion(DDPM):
     """main class"""
     def __init__(self,
                  first_stage_config,
@@ -444,7 +446,7 @@ class LatentDiffusion(DDPM):
                  *args, **kwargs):
         self.jumpsched = None
         self.ddimsteps = None
-        self.distilledstepsperphase = None
+        self.distillphase = None
 
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
@@ -880,6 +882,27 @@ class LatentDiffusion(DDPM):
 
     def forward(self, x, c, *args, **kwargs):
         # print(x.shape)
+        # sample time steps from the allowed jump starts for this distillation phase
+        prev_jump_dict, jump_dict = self.get_jump_dicts()
+        jump_starts = random.choices(list(jump_dict.keys()), k=x.shape[0])
+        jump_ends = [jump_dict[k] for k in jump_starts]
+        jump_ts = [jump_starts]
+        while any([a > b for a, b in zip(jump_ts[-1], jump_ends)]):
+            jump_ts.append([prev_jump_dict[k] for k in jump_ts[-1]])
+
+        # t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+        assert self.model.conditioning_key is None
+        if self.model.conditioning_key is not None:
+            assert c is not None
+            if self.cond_stage_trainable:
+                c = self.get_learned_conditioning(c)
+            if self.shorten_cond_schedule:  # TODO: drop this option
+                tc = self.cond_ids[t].to(self.device)
+                c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
+        return self.p_losses(x, c, jump_ts, *args, **kwargs)
+
+    def oldforward(self, x, c, *args, **kwargs):
+        # print(x.shape)
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         if self.model.conditioning_key is not None:
             assert c is not None
@@ -900,7 +923,8 @@ class LatentDiffusion(DDPM):
 
         return [rescale_bbox(b) for b in bboxes]
 
-    def apply_model(self, x_noisy, t, cond, return_ids=False):
+    def apply_model(self, x_noisy, t, cond, return_ids=False, model=None):
+        model_for_forward = self.model if model is None else model
 
         if isinstance(cond, dict):
             # hybrid case, cond is exptected to be a dict
@@ -984,7 +1008,7 @@ class LatentDiffusion(DDPM):
                 cond_list = [cond for i in range(z.shape[-1])]  # Todo make this more efficient
 
             # apply model by loop over crops
-            output_list = [self.model(z_list[i], t, **cond_list[i]) for i in range(z.shape[-1])]
+            output_list = [model_for_forward(z_list[i], t, **cond_list[i]) for i in range(z.shape[-1])]
             assert not isinstance(output_list[0],
                                   tuple)  # todo cant deal with multiple model outputs check this never happens
 
@@ -996,7 +1020,7 @@ class LatentDiffusion(DDPM):
             x_recon = fold(o) / normalization
 
         else:
-            x_recon = self.model(x_noisy, t, **cond)
+            x_recon = model_for_forward(x_noisy, t, **cond)
 
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]
@@ -1021,10 +1045,67 @@ class LatentDiffusion(DDPM):
         kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def p_losses(self, x_start, cond, t, noise=None):
-        noise = default(noise, lambda: torch.randn_like(x_start))
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        model_output = self.apply_model(x_noisy, t, cond)
+    @torch.no_grad()
+    def p_sample_ddim(self, xt, cond, jump_start_t, jump_end_t, repeat_noise=False, quantize_denoised=False,
+                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
+                      unconditional_guidance_scale=1., unconditional_conditioning=None, model=None):
+        b, *_, device = *xt.shape, xt.device
+
+        if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
+            e_t = self.apply_model(xt, jump_start_t, cond, model=model)
+        else:
+            x_in = torch.cat([xt] * 2)
+            t_in = torch.cat([jump_start_t] * 2)
+            c_in = torch.cat([unconditional_conditioning, cond])
+            e_t_uncond, e_t = self.apply_model(x_in, t_in, c_in, model=model).chunk(2)
+            e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
+
+        if score_corrector is not None:
+            assert self.parameterization == "eps"
+            e_t = score_corrector.modify_score(self.model, e_t, xt, jump_start_t, cond, **corrector_kwargs)
+
+        # select parameters corresponding to the currently considered timestep
+        # NOTE:
+        # self.alphas_cumprod_ (note: underscore) corresponds to normal (as in paper) indexes, so T=1000, t=0 is end result)
+        # jump_start_t and jump_end_t are also using these normal indexes
+        a_t = extract_into_tensor(self.alphas_cumprod_, jump_start_t, xt.shape)
+        a_tm1 = extract_into_tensor(self.alphas_cumprod_, jump_end_t, xt.shape)     # should be (b, 1, 1, 1)
+
+        # current prediction for x_0
+        pred_x0 = (xt - (1 - a_t).sqrt() * e_t) / a_t.sqrt()
+        if quantize_denoised:
+            pred_x0, _, *_ = self.first_stage_model.quantize(pred_x0)
+        # direction pointing to x_t
+        dir_xt = (1. - a_tm1).sqrt() * e_t
+        x_tm1 = a_tm1.sqrt() * pred_x0 + dir_xt
+        return x_tm1, pred_x0
+
+    @property
+    def alphas_cumprod_(self):
+        if not hasattr(self, "_cached_alphas_cumprod_") or self._cached_alphas_cumprod_ is None:
+            self._cached_alphas_cumprod_ = torch.cat([self.alphas_cumprod_prev[0:1], self.alphas_cumprod], 0)
+        return self._cached_alphas_cumprod_
+
+    def p_losses(self, x_start, cond, jump_ts, noise=None):
+        assert self.parameterization == "eps"       # doesn't work for other ones yet
+        noise = default(noise, lambda: torch.randn_like(x_start))       # noise is the same
+        t = torch.tensor(jump_ts[0], device=self.device, dtype=torch.long)
+        x_t = self.q_sample(x_start=x_start, t=t, noise=noise)          # this starting point is the same
+
+        # Perform DDIM steps to reach x_t-k
+        with torch.no_grad():
+            self.teacher.eval()
+            x_tmk = x_t
+            for i in range(1, len(jump_ts)):
+                subjump_start_t = torch.tensor(jump_ts[i-1], device=self.device, dtype=torch.long)
+                subjump_end_t = torch.tensor(jump_ts[i], device=self.device, dtype=torch.long)
+                x_tmk, pred_x0 = self.p_sample_ddim(x_tmk, cond, subjump_start_t, subjump_end_t,
+                                                    model=self.teacher)
+
+        # compute target eps or x_0 base on x_t-k
+            # TODO
+
+        model_output = self.apply_model(x_t, t, cond)
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
@@ -1040,20 +1121,7 @@ class LatentDiffusion(DDPM):
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
-        logvar_t = self.logvar[t].to(self.device)
-        loss = loss_simple / torch.exp(logvar_t) + logvar_t
-        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
-        if self.learn_logvar:
-            loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
-            loss_dict.update({'logvar': self.logvar.data.mean()})
-
-        loss = self.l_simple_weight * loss.mean()
-
-        loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
-        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
-        loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
-
-        loss += (self.original_elbo_weight * loss_vlb)
+        loss = loss_simple.mean()
         loss_dict.update({f'{prefix}/loss': loss})
 
         return loss, loss_dict
@@ -1406,18 +1474,56 @@ class LatentDiffusion(DDPM):
         x = 2. * (x - x.min()) / (x.max() - x.min()) - 1.
         return x
 
-    def set_distill_schedule(self, jumpsched):
+    def init_distill_schedule(self, jumpsched):
         # initialize jump schedule and its timesteps
         # we will be using the DDIM steps during distillation
         self.register_buffer("jumpsched", torch.tensor(list(jumpsched)))
-        self.register_buffer("ddimsteps", torch.tensor(make_ddim_timesteps("uniform", jumpsched[0], self.num_timesteps)))
-        # generate the selections of DDIM steps to be used in every distillation phase
-        distilledstepsperphase = []
-        for i, j in zip(jumpsched[:-1], jumpsched[1:]):
-            assert i % j == 0       # assert that is divisible
-            distilledstepsperphase.append(i // j)
-        print(distilledstepsperphase)
-        self.register_buffer("distilledstepsperphase", torch.tensor(distilledstepsperphase))
+        self.register_buffer("distillphase", torch.tensor([0]))
+        self.jump_dicts = self.compute_jump_dicts()
+        self.advance_distill_phase()
+
+    def advance_distill_phase(self):
+        self.distillphase[0] += 1
+
+    def get_jump_size(self, phase=None): # how many sub-jumps are in current jump?
+        jumpsched = list(self.jumpsched.cpu().numpy())
+        phase = phase if phase is not None else self.get_distill_phase()
+        ret = jumpsched[phase-1] // jumpsched[phase]
+        return ret
+
+    def get_distill_phase(self):
+        return self.distillphase[0].cpu().item()
+
+    def get_jump_dicts(self):
+        phase = self.get_distill_phase()
+        return self.jump_dicts[phase-1], self.jump_dicts[phase]
+
+    def compute_jump_dicts(self):        # compute jump dicts for all phases
+        jumpsched = list(self.jumpsched.cpu().numpy())
+        num_timesteps = self.num_timesteps
+        ddimsteps = make_ddim_timesteps("uniform", jumpsched[0], num_timesteps)
+        for i in range(1, len(ddimsteps)):
+            assert ddimsteps[i][0] == ddimsteps[i-1][1]
+        jump_dict = {k: v for k, v in ddimsteps}
+        alldicts = [jump_dict]
+
+        # code below simulates previous phases of distillation (recomputed at every advance)
+        for phase in range(1, len(jumpsched)):
+            # how many steps per jump in this phase?
+            jumpmult = jumpsched[phase-1] // jumpsched[phase]
+            # update jump starts and dict
+            new_jump_dict = {}
+            jumpstart = max(jump_dict.keys())
+            while jumpstart != 0:    # while not reached end
+                jumpend = jump_dict[jumpstart]
+                for _ in range(jumpmult-1):     # perform a few steps
+                    jumpend = jump_dict[jumpend]
+                new_jump_dict[jumpstart] = jumpend
+                jumpstart = jumpend
+            phase += 1
+            jump_dict = new_jump_dict
+            alldicts.append(new_jump_dict)
+        return alldicts
 
 
 class DiffusionWrapper(pl.LightningModule):
@@ -1449,7 +1555,7 @@ class DiffusionWrapper(pl.LightningModule):
         return out
 
 
-class Layout2ImgDiffusion(LatentDiffusion):
+class Layout2ImgDiffusion(DLatentDiffusion):
     # TODO: move all layout-specific hacks to this class
     def __init__(self, cond_stage_key, *args, **kwargs):
         assert cond_stage_key == 'coordinates_bbox', 'Layout2ImgDiffusion only for cond_stage_key="coordinates_bbox"'
@@ -1478,12 +1584,49 @@ class Layout2ImgDiffusion(LatentDiffusion):
 def create_latent_diffusion_distiller(teacher_ckpt=None, jumpsched=None, cond_stage_config=None):
     model, teacher_config, logdir, global_step = load_from_checkpoint(teacher_ckpt, tuple())
     teacher_unet = deepcopy(model.model)
-    model.__class__ = LatentDiffusion
+    model.__class__ = DLatentDiffusion
     model.teacher = teacher_unet
     model.teacher.eval()
-    model.set_distill_schedule(jumpsched)
+    model.init_distill_schedule(jumpsched)
+
+    tst_dldm(model)     # TODO: remove this line
+
     return model
 
-# TODO: implement mechanism to advance distillation schedule (callback in main.py that drives diffusion class in this file)
+
+def tst_dldm(m):
+    x = torch.randn((25, 3, 64, 64)).to(m.device)
+    m(x, None)
+
+
+class DistillPhaserCallback(pl.Callback):
+    # Advances the distillation phase and saves checkpoint when phase ends
+    def __init__(self, updatesperphase=tuple()):
+        super().__init__()
+        self.state_key = "distilphaser"
+        self.numiter = 0
+        self.updatesperphase = updatesperphase
+        self._init()
+
+    def _init(self):
+        self.thresholds = set(np.cumsum(self.updatesperphase))
+
+    def load_state_dict(self, state_dict):
+        for k, v in state_dict.items():
+            setattr(self, k, v)
+        self._init()
+
+    def state_dict(self):
+        return {"numiter": self.numiter, "updatesperphase": self.updatesperphase}
+
+    def on_train_batch_end(self, trainer, plmodule, *args, **kwargs):
+        self.numiter += 1
+        if self.numiter in self.thresholds:
+            current_number_jumps = plmodule.jumpsched[plmodule.distillphase.cpu().item()].cpu().item()
+            trainer.save_checkpoint(os.path.join(trainer.logdir, f"distilled{current_number_jumps}jumps.ckpt"))
+            plmodule.advance_distill_phase()
+
+
+# TODO: TEST: implement mechanism to advance distillation schedule (callback in main.py that drives diffusion class in this file)
 # TODO: implement distillation loss (perform deterministic DDIM steps, compute L1/L2 loss)
 # TODO: implement log_images and image sampler
