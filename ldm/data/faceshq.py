@@ -32,7 +32,7 @@ class CelebAHQTrain(FacesBase):
         root = "data/celebahq256/train/"
         paths = [os.path.join(root, f) for f in os.listdir(root) if os.path.isfile(os.path.join(root, f))]
         # TODO remove following line
-        paths = paths[:100]
+        # paths = paths[:100]
         self.data = ImagePaths(paths=paths, size=size, random_crop=False)
         self.keys = keys
 
@@ -46,7 +46,7 @@ class CelebAHQAll(FacesBase):
             _paths = [os.path.join(roote, f) for f in os.listdir(roote) if os.path.isfile(os.path.join(roote, f))]
             paths += _paths
         # TODO remove following line
-        paths = paths[:100]
+        # paths = paths[:100]
         self.data = ImagePaths(paths=paths, size=size, random_crop=False)
         self.keys = keys
 
@@ -57,7 +57,7 @@ class CelebAHQValidation(FacesBase):
         root = "data/celebahq256/valid/"
         paths = [os.path.join(root, f) for f in os.listdir(root) if os.path.isfile(os.path.join(root, f))]
         # TODO remove following line
-        paths = paths[:100]
+        # paths = paths[:100]
         self.data = ImagePaths(paths=paths, size=size, random_crop=False)
         self.keys = keys
 
