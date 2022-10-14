@@ -90,7 +90,7 @@ lightning:
     distillphaser:
       target: ldm.models.diffusion.distill.DistillPhaserCallback
       params:
-        updatesperphase: [15000, 15000, 15000, 15000, 15000, 15000, 15000, 30000, 30000]
+        updatesperphase: [30000, 30000, 30000, 30000, 30000, 30000, 30000, 60000, 60000]
 
   trainer:
     benchmark: True

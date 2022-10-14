@@ -10,7 +10,7 @@ class LitEma(nn.Module):
 
         self.m_name2s_name = {}
         self.register_buffer('decay', torch.tensor(decay, dtype=torch.float32))
-        self.register_buffer('num_updates', torch.tensor(0,dtype=torch.int) if use_num_upates
+        self.register_buffer('num_updates', torch.tensor(0, dtype=torch.int) if use_num_upates
                              else torch.tensor(-1,dtype=torch.int))
 
         for name, p in model.named_parameters():
@@ -22,7 +22,7 @@ class LitEma(nn.Module):
 
         self.collected_params = []
 
-    def forward(self,model):
+    def forward(self, model):
         decay = self.decay
 
         if self.num_updates >= 0:
@@ -43,7 +43,7 @@ class LitEma(nn.Module):
                 else:
                     assert not key in self.m_name2s_name
 
-    def copy_to(self, model):
+    def copy_to(self, model):       # copies EMA buffers into model
         m_param = dict(model.named_parameters())
         shadow_params = dict(self.named_buffers())
         for key in m_param:

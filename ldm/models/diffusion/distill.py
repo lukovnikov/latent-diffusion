@@ -1046,23 +1046,23 @@ class DLatentDiffusion(DDPM):
         return mean_flat(kl_prior) / np.log(2.0)
 
     @torch.no_grad()
-    def p_sample_ddim(self, xt, cond, jump_start_t, jump_end_t, repeat_noise=False, quantize_denoised=False,
+    def ddim_sample_step(self, xt, cond, jump_start_t, jump_end_t, repeat_noise=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None, model=None):
         b, *_, device = *xt.shape, xt.device
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-            e_t = self.apply_model(xt, jump_start_t, cond, model=model)
+            e_t = self.apply_model(xt, jump_start_t-1, cond, model=model)
         else:
             x_in = torch.cat([xt] * 2)
-            t_in = torch.cat([jump_start_t] * 2)
+            t_in = torch.cat([jump_start_t-1] * 2)
             c_in = torch.cat([unconditional_conditioning, cond])
             e_t_uncond, e_t = self.apply_model(x_in, t_in, c_in, model=model).chunk(2)
             e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
 
         if score_corrector is not None:
             assert self.parameterization == "eps"
-            e_t = score_corrector.modify_score(self.model, e_t, xt, jump_start_t, cond, **corrector_kwargs)
+            e_t = score_corrector.modify_score(self.model, e_t, xt, jump_start_t-1, cond, **corrector_kwargs)
 
         # select parameters corresponding to the currently considered timestep
         # NOTE:
@@ -1090,7 +1090,8 @@ class DLatentDiffusion(DDPM):
         assert self.parameterization == "eps"       # doesn't work for other ones yet
         noise = default(noise, lambda: torch.randn_like(x_start))       # noise is the same
         t = torch.tensor(jump_ts[0], device=self.device, dtype=torch.long)
-        x_t = self.q_sample(x_start=x_start, t=t, noise=noise)          # this starting point is the same
+        tmk = torch.tensor(jump_ts[-1], device=self.device, dtype=torch.long)
+        x_t = self.q_sample(x_start=x_start, t=t-1, noise=noise)          # this starting point is the same
 
         # Perform DDIM steps to reach x_t-k
         with torch.no_grad():
@@ -1099,23 +1100,26 @@ class DLatentDiffusion(DDPM):
             for i in range(1, len(jump_ts)):
                 subjump_start_t = torch.tensor(jump_ts[i-1], device=self.device, dtype=torch.long)
                 subjump_end_t = torch.tensor(jump_ts[i], device=self.device, dtype=torch.long)
-                x_tmk, pred_x0 = self.p_sample_ddim(x_tmk, cond, subjump_start_t, subjump_end_t,
+                x_tmk, pred_x0 = self.ddim_sample_step(x_tmk, cond, subjump_start_t, subjump_end_t,
                                                     model=self.teacher)
 
-        # compute target eps or x_0 base on x_t-k
-            # TODO
+        # Compute target eps or x_0 base on x_t-k
+            a_t = extract_into_tensor(self.alphas_cumprod_, t, x_t.shape)
+            a_tmk = extract_into_tensor(self.alphas_cumprod_, tmk, x_t.shape)
+            eps_star = (x_tmk - (a_tmk / a_t).sqrt() * x_t) / \
+                       ((1 - a_tmk).sqrt() - (a_tmk * (1 - a_t) / a_t).sqrt())
+            target = eps_star
 
+            # Below code is for testing that the computed eps_star will give us x_t-k
+            # x_0_star = (x_t - (1 - a_t).sqrt() * eps_star) / a_t.sqrt()
+            # x_tmk_star = (a_tmk.sqrt() * x_0_star + (1 - a_tmk).sqrt() * eps_star)
+            # assert torch.allclose(x_tmk_star, x_tmk, atol=1e-6)
+
+        # Run model
         model_output = self.apply_model(x_t, t, cond)
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
-
-        if self.parameterization == "x0":
-            target = x_start
-        elif self.parameterization == "eps":
-            target = noise
-        else:
-            raise NotImplementedError()
 
         # print(x_start.shape)
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
@@ -1474,16 +1478,23 @@ class DLatentDiffusion(DDPM):
         x = 2. * (x - x.min()) / (x.max() - x.min()) - 1.
         return x
 
-    def init_distill_schedule(self, jumpsched):
+    def init_distill(self, jumpsched):
         # initialize jump schedule and its timesteps
         # we will be using the DDIM steps during distillation
         self.register_buffer("jumpsched", torch.tensor(list(jumpsched)))
         self.register_buffer("distillphase", torch.tensor([0]))
         self.jump_dicts = self.compute_jump_dicts()
+        self.teacher = deepcopy(self.model)
         self.advance_distill_phase()
 
     def advance_distill_phase(self):
         self.distillphase[0] += 1
+        # copy current student's EMA weights into teacher
+        self.model_ema.copy_to(self.teacher)
+
+        # teacher_unet = deepcopy(self.model)
+        # self.model_ema.copy_to(teacher_unet)        # use EMA weights for teacher
+        # self.teacher = teacher_unet
 
     def get_jump_size(self, phase=None): # how many sub-jumps are in current jump?
         jumpsched = list(self.jumpsched.cpu().numpy())
@@ -1583,11 +1594,10 @@ class Layout2ImgDiffusion(DLatentDiffusion):
 
 def create_latent_diffusion_distiller(teacher_ckpt=None, jumpsched=None, cond_stage_config=None):
     model, teacher_config, logdir, global_step = load_from_checkpoint(teacher_ckpt, tuple())
-    teacher_unet = deepcopy(model.model)
     model.__class__ = DLatentDiffusion
-    model.teacher = teacher_unet
-    model.teacher.eval()
-    model.init_distill_schedule(jumpsched)
+    model.model_ema.decay *= 0.
+    model.model_ema.decay += 0.999      # set faster decay
+    model.init_distill(jumpsched)
 
     tst_dldm(model)     # TODO: remove this line
 
@@ -1603,10 +1613,13 @@ class DistillPhaserCallback(pl.Callback):
     # Advances the distillation phase and saves checkpoint when phase ends
     def __init__(self, updatesperphase=tuple()):
         super().__init__()
-        self.state_key = "distilphaser"
         self.numiter = 0
         self.updatesperphase = updatesperphase
         self._init()
+
+    @property
+    def state_key(self):
+        return "distillphaser"
 
     def _init(self):
         self.thresholds = set(np.cumsum(self.updatesperphase))
@@ -1625,8 +1638,11 @@ class DistillPhaserCallback(pl.Callback):
             current_number_jumps = plmodule.jumpsched[plmodule.distillphase.cpu().item()].cpu().item()
             trainer.save_checkpoint(os.path.join(trainer.logdir, f"distilled{current_number_jumps}jumps.ckpt"))
             plmodule.advance_distill_phase()
+            print("advanced distillation phase")
+            print(plmodule.distillphase)
 
 
 # TODO: TEST: implement mechanism to advance distillation schedule (callback in main.py that drives diffusion class in this file)
-# TODO: implement distillation loss (perform deterministic DDIM steps, compute L1/L2 loss)
-# TODO: implement log_images and image sampler
+# TODO: TEST: implement distillation loss (perform deterministic DDIM steps, compute L1/L2 loss)
+# TODO: implement log_images and image sampler (disabled for now)
+# TODO: learning rate schedule

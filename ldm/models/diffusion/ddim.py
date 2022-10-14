@@ -171,7 +171,7 @@ class DDIMSampler(object):
         print(f"Running DDIM Sampling with {len(timesteps)} timesteps")
 
         for i, (jump_start_t, jump_end_t) in enumerate(tqdm(timesteps, desc='DDIM Sampler', total=len(timesteps))):
-            ts = torch.full((b,), jump_start_t-1, device=device, dtype=torch.long)      # jump_start_t - 1 because jump_start_t is in regular time range (ends at 1000)
+            ts = torch.full((b,), jump_start_t, device=device, dtype=torch.long) - 1      # jump_start_t - 1 because jump_start_t is in regular time range (ends at 1000)
 
             if mask is not None:
                 assert x0 is not None
