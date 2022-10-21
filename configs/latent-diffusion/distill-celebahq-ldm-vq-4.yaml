@@ -1,5 +1,5 @@
 model:
-  base_learning_rate: 2.0e-06
+  base_learning_rate: 0 #2.0e-06
   target: ldm.models.diffusion.distill.create_latent_diffusion_distiller
   params:
     teacher_ckpt: models/ldm/celeba256
@@ -90,7 +90,10 @@ lightning:
     distillphaser:
       target: ldm.models.diffusion.distill.DistillPhaserCallback
       params:
-        updatesperphase: [15000, 15000, 15000, 15000, 15000, 15000, 15000, 30000, 30000]
+        updatesperphase: [9000, 9000, 9000, 9000, 9000, 9000, 9000, 18000, 18000]
+        # updatesperphase: [2, 2, 2, 2, 2, 2, 2, 2, 2]
 
   trainer:
     benchmark: True
+    gradient_clip_val: 1.0
+    use_scheduler: True

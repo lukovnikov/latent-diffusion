@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import pytorch_lightning as pl
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
 from einops import rearrange, repeat
 from contextlib import contextmanager
 from functools import partial
@@ -427,7 +427,16 @@ class DDPM(pl.LightningModule):
         if self.learn_logvar:
             params = params + [self.logvar]
         opt = torch.optim.AdamW(params, lr=lr)
-        return opt
+        # put learning rate schedulers here
+        self.sched = ResettableLinearLR(opt)
+        ret = {
+            "optimizer": opt,
+            "lr_scheduler": {
+                "scheduler": self.sched,
+                "interval": "step",
+            }
+        }
+        return ret
 
 
 class DLatentDiffusion(DDPM):
@@ -1454,15 +1463,17 @@ class DLatentDiffusion(DDPM):
         if self.learn_logvar:
             print('Diffusion model optimizing logvar')
             params.append(self.logvar)
-        opt = torch.optim.AdamW(params, lr=lr)
-        if self.use_scheduler:
-            assert 'target' in self.scheduler_config
-            scheduler = instantiate_from_config(self.scheduler_config)
+        opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.)
+        if True:
+            # assert 'target' in self.scheduler_config
+            # scheduler = instantiate_from_config(self.scheduler_config)
 
-            print("Setting up LambdaLR scheduler...")
+            sched = ResettableLinearLR(opt, )
+
+            print("Setting up ResettableLineareLR scheduler...")
             scheduler = [
                 {
-                    'scheduler': LambdaLR(opt, lr_lambda=scheduler.schedule),
+                    'scheduler': sched,
                     'interval': 'step',
                     'frequency': 1
                 }]
@@ -1491,6 +1502,7 @@ class DLatentDiffusion(DDPM):
         self.distillphase[0] += 1
         # copy current student's EMA weights into teacher
         self.model_ema.copy_to(self.teacher)
+        print(f"Advanced distillation phase by factor {self.get_jump_size()} and copied current EMA weights to teacher")
 
         # teacher_unet = deepcopy(self.model)
         # self.model_ema.copy_to(teacher_unet)        # use EMA weights for teacher
@@ -1590,13 +1602,11 @@ class Layout2ImgDiffusion(DLatentDiffusion):
         return logs
 
 
-
-
 def create_latent_diffusion_distiller(teacher_ckpt=None, jumpsched=None, cond_stage_config=None):
     model, teacher_config, logdir, global_step = load_from_checkpoint(teacher_ckpt, tuple())
     model.__class__ = DLatentDiffusion
     model.model_ema.decay *= 0.
-    model.model_ema.decay += 0.999      # set faster decay
+    model.model_ema.decay += 0.99      # set faster decay
     model.init_distill(jumpsched)
 
     tst_dldm(model)     # TODO: remove this line
@@ -1607,6 +1617,40 @@ def create_latent_diffusion_distiller(teacher_ckpt=None, jumpsched=None, cond_st
 def tst_dldm(m):
     x = torch.randn((25, 3, 64, 64)).to(m.device)
     m(x, None)
+
+
+class ResettableLinearLR(LambdaLR):
+    def __init__(self, optimizer, numsteps=100, startmult=1., endmult=0., verbose=False):
+        self.numsteps = numsteps
+        self.startmult = startmult
+        self.endmult = endmult
+        f = lambda step: self.compute_lr(step)
+        super().__init__(optimizer, f, verbose=verbose)
+
+    def compute_lr(self, step):
+        assert step <= self.numsteps
+        fraction = step / (self.numsteps - 1)
+        ret = fraction * self.endmult + (1 - fraction) * self.startmult
+        return ret
+
+    def reset(self, numsteps=None, startmult=None, endmult=None):
+        self.numsteps = numsteps if numsteps is not None else self.numsteps
+        self.startmult = startmult if startmult is not None else self.startmult
+        self.endmult = endmult if endmult is not None else self.endmult
+        self.last_epoch = 0
+
+
+def tst_resettable_linear_lr():
+    m = torch.nn.Linear(4, 4)
+    opt = torch.optim.Adam(m.parameters(), lr=0.001)
+    sched = ResettableLinearLR(opt, numsteps=10)
+    lrs = []
+    for i in range(10):
+        for j in range(10):
+            lrs.append(sched.get_lr())
+            sched.step()
+        sched.reset()
+    print(lrs)
 
 
 class DistillPhaserCallback(pl.Callback):
@@ -1622,7 +1666,14 @@ class DistillPhaserCallback(pl.Callback):
         return "distillphaser"
 
     def _init(self):
-        self.thresholds = set(np.cumsum(self.updatesperphase))
+        cums = list(np.cumsum(self.updatesperphase))
+        self.thresholds = dict(zip(cums, self.updatesperphase[1:] + [0]))
+        self.totalsteps = cums[-1]
+
+    def on_train_start(self, trainer, pl_module) -> None:
+        for sched in trainer.lr_schedulers:
+            if isinstance(sched["scheduler"], ResettableLinearLR):
+                sched["scheduler"].reset(self.updatesperphase[self.numiter])
 
     def load_state_dict(self, state_dict):
         for k, v in state_dict.items():
@@ -1637,12 +1688,28 @@ class DistillPhaserCallback(pl.Callback):
         if self.numiter in self.thresholds:
             current_number_jumps = plmodule.jumpsched[plmodule.distillphase.cpu().item()].cpu().item()
             trainer.save_checkpoint(os.path.join(trainer.logdir, f"distilled{current_number_jumps}jumps.ckpt"))
+            if self.numiter == self.totalsteps:
+                print("terminating training because end of distillation schedule reached")
+                trainer.should_stop = True
+                return
             plmodule.advance_distill_phase()
             print("advanced distillation phase")
             print(plmodule.distillphase)
+            # reset lr scheduler and provide the correct number of steps
+            for sched in trainer.lr_schedulers:
+                if isinstance(sched["scheduler"], ResettableLinearLR):
+                    sched["scheduler"].reset(numsteps=self.thresholds[self.numiter])
+                    print(f"reset scheduler to do {sched['scheduler'].numsteps} steps")
 
 
 # TODO: TEST: implement mechanism to advance distillation schedule (callback in main.py that drives diffusion class in this file)
 # TODO: TEST: implement distillation loss (perform deterministic DDIM steps, compute L1/L2 loss)
 # TODO: implement log_images and image sampler (disabled for now)
-# TODO: learning rate schedule
+# TODO: TEST: learning rate schedule
+# TODO: log learning rate
+# DONE: grad norm clipping
+# TODO (won't do yet?): reset optimizer momentums
+# TODO: make sure we don't over-jump distill phase
+
+if __name__ == '__main__':
+    tst_resettable_linear_lr()
